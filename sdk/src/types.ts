@@ -18,7 +18,10 @@ export interface ProofArtifacts {
   proof: Uint8Array;
   publicInputs: Uint8Array;
   vk: Uint8Array;
+  /** 32-byte Poseidon2 nullifier (public input). */
   nullifier: Uint8Array;
+  /** 32-byte Poseidon2 credential commitment (public input). */
+  commitment: Uint8Array;
 }
 
 export interface VerificationResult {
@@ -34,9 +37,9 @@ export interface VerificationResult {
  * records and computes:
  *   - `commitment` = poseidon2(kycLevel, countryCode, salt)
  *   - `attestedCredential` = poseidon2(kycLevel, countryCode)
- * and registers both on-chain via `registerCommitment` (AZ-002). Proofs
- * may only use attested credentials — self-asserted values are rejected
- * by the verifier contract.
+ * and registers the commitment on-chain via `registerCommitment` (AZ-002).
+ * Proofs may only use attested credentials — self-asserted values are
+ * rejected by the verifier contract.
  */
 export interface KycAttestation {
   commitment: string;
