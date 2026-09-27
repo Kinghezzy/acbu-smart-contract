@@ -15,7 +15,6 @@ jobs:
   cargo-clippy:
     name: Cargo Clippy
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -49,7 +48,6 @@ jobs:
   cargo-build:
     name: Cargo Build
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -85,7 +83,6 @@ jobs:
   cargo-test:
     name: Cargo Test
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -110,9 +107,7 @@ jobs:
         run: bash scripts/fetch_token_wasm.sh
 
       - name: Run tests
-        # AX-011: --locked ensures tests run against exactly the pinned dependency graph.
-        run: cargo test --locked --workspace -- --nocapture
-        continue-on-error: true
+        run: cargo test --workspace -- --nocapture
 
   nargo-test:
     name: Nargo Test
