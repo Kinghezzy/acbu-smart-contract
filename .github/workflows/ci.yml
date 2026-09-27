@@ -15,7 +15,6 @@ jobs:
   cargo-clippy:
     name: Cargo Clippy
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -47,7 +46,6 @@ jobs:
   cargo-build:
     name: Cargo Build
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -81,7 +79,6 @@ jobs:
   cargo-test:
     name: Cargo Test
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -107,7 +104,6 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace -- --nocapture
-        continue-on-error: true
 
   nargo-test:
     name: Nargo Test
