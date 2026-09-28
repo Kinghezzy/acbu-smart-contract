@@ -40,7 +40,9 @@ jobs:
         run: bash scripts/fetch_token_wasm.sh
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # AX-011: --locked pins cargo to the committed Cargo.lock so a transitive
+        # dep bump can never silently change on-chain WASM between CI runs.
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
         continue-on-error: true
 
   cargo-build:
@@ -71,10 +73,12 @@ jobs:
         run: bash scripts/fetch_token_wasm.sh
 
       - name: Build workspace
-        run: cargo build --workspace
+        # AX-011: --locked pins cargo to the committed Cargo.lock so a transitive
+        # dep bump can never silently change the on-chain WASM binary.
+        run: cargo build --locked --workspace
 
       - name: Build WASM targets
-        run: cargo build --workspace --target wasm32-unknown-unknown --release
+        run: cargo build --locked --workspace --target wasm32-unknown-unknown --release
 
   cargo-test:
     name: Cargo Test
