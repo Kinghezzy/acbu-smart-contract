@@ -138,16 +138,18 @@ Provides multi-signature authorization for administrative actions.
 ### Key Functions
 
 - `initialize`: Set up signers and threshold
-- `propose`: Create new proposal
+- `propose(target, action)`: Create a proposal authorising a typed action on a specific contract
 - `approve`: Approve proposal (signer function)
-- `execute`: Execute approved proposal
-- `add_signer/remove_signer`: Manage signers
+- `execute`: Execute the approved proposal, invoking exactly the stored target and action
+- `propose_update_config`: Propose a new signer set and threshold
+- `propose_upgrade`: Propose a WASM upgrade of the multisig itself
 
 ### Security
 
 - M-of-N threshold signatures
 - Proposal expiry
-- Nonce-based replay prevention
+- Approvals and execution are bound to a typed `MultisigAction` and target, so a
+  proposal can only ever perform the action the signers approved
 
 ---
 
@@ -180,16 +182,28 @@ Provides peer-to-peer lending functionality for ACBU tokens.
 - `initialize`: Configure admin and token
 - `deposit`: Deposit ACBU into lending pool
 - `withdraw`: Withdraw ACBU from lending pool
-- `borrow`: Borrow ACBU with collateral
+- `borrow`: Borrow ACBU from a specific lender's liquidity (borrower and lender
+  must both authorize)
 - `repay`: Repay borrowed ACBU
-- `liquidate`: Liquidate undercollateralized loans
 
 ### Features
 
-- Collateralized lending
+- Uncollateralized, single-asset lending: liquidity and principal are both ACBU
 - Interest accrual
-- Liquidation mechanism
 - Pool balance tracking
+
+### Collateral policy
+
+The pool takes no collateral. Posting ACBU against an ACBU loan locks at least as
+much of the borrowed asset as it releases, so it extends no purchasing power and
+gives the lender no protection; the earlier `collateral_amount >= amount` check
+has been removed. Because the loan is unsecured, the lender bears the full credit
+risk and must authorize each individual loan alongside the borrower.
+
+`LoanData.collateral_amount` (always `0`) and error code `2014`
+(`InsufficientCollateral`) are reserved for a future *distinct-asset* collateral
+extension, which also requires oracle pricing and a liquidation path. No
+`liquidate` entrypoint exists today: an unrepaid loan remains open in storage.
 
 ---
 

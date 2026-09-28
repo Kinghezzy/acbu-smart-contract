@@ -5,11 +5,12 @@ use soroban_sdk::{
 };
 
 use shared::{
-    calculate_fee, check_oracle_freshness, reentrancy_guard, BurnEvent, ContractError,
+    any_circuit_peer_paused, calculate_fee, check_oracle_freshness, reentrancy_guard,
+    validate_circuit_peers, BurnEvent, ContractError,
     ContractPhase, CurrencyCode, DataKey as SharedDataKey, BASIS_POINTS, CONTRACT_VERSION,
     DECIMALS, MIN_BURN_AMOUNT, ORACLE_GET_ACBU_RATE_WITH_TS, ORACLE_GET_BASKET_WEIGHT,
     ORACLE_GET_CURRENCIES, ORACLE_GET_RATE_WITH_TS, ORACLE_GET_S_TOKEN_ADDR,
-    RESERVE_IS_SUFFICIENT, TOKEN_GET_TOTAL_SUPPLY, UPDATE_INTERVAL_SECONDS,
+    MINTING_RECORD_BURN, RESERVE_IS_SUFFICIENT, TOKEN_GET_TOTAL_SUPPLY, UPDATE_INTERVAL_SECONDS,
 };
 
 #[contracttype]
@@ -27,6 +28,12 @@ pub struct DataKey {
     pub min_burn_amount: Symbol,
     pub pending_admin: Symbol,
     pub pending_admin_eligible_at: Symbol,
+    /// `Vec<Address>` of circuit-breaker peers (minting, reserve tracker, …) whose
+    /// pause also halts redemption (AC-030).
+    pub circuit_peers: Symbol,
+    /// Minting contract notified of every burn so its supply tracker stays
+    /// in step with the token (AC-005).
+    pub minting_contract: Symbol,
 }
 
 const DATA_KEY: DataKey = DataKey {
@@ -42,6 +49,8 @@ const DATA_KEY: DataKey = DataKey {
     min_burn_amount: symbol_short!("MIN_BURN"),
     pending_admin: symbol_short!("PEND_ADM"),
     pending_admin_eligible_at: symbol_short!("PA_ETA"),
+    circuit_peers: symbol_short!("CB_PEERS"),
+    minting_contract: symbol_short!("MINTING"),
 };
 
 
@@ -74,6 +83,7 @@ impl BurningContract {
     /// Sets up all required addresses and fee parameters. Panics if called a
     /// second time (`admin` key already exists) or if either fee rate is
     /// outside [0, BASIS_POINTS].
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -129,15 +139,20 @@ impl BurningContract {
     /// transfers the equivalent S-token amount to `recipient` from the vault.
     /// Requires that both the ACBU/USD and currency/USD oracle prices are fresh
     /// (within `UPDATE_INTERVAL_SECONDS`) and that reserves are sufficient.
+    ///
+    /// `min_stoken_out` is an optional slippage guard: if the computed S-token
+    /// output is below this value the transaction reverts with `SlippageExceeded`
+    /// before any ACBU is burned. Pass `None` to disable the check.
     pub fn redeem_single(
         env: Env,
         user: Address,
         recipient: Address,
         acbu_amount: i128,
         currency: CurrencyCode,
+        min_stoken_out: Option<i128>,
     ) -> i128 {
 
-        Self::check_paused(&env);
+        Self::check_circuit(&env);
         user.require_auth();
         Self::validate_recipient(&env, &recipient);
         Self::extend_instance_ttl(&env);
@@ -193,7 +208,8 @@ impl BurningContract {
             vec![&env, currency.clone().into_val(&env)],
         );
 
-        let fee = calculate_fee(acbu_amount, fee_single);
+        let fee = calculate_fee(acbu_amount, fee_single)
+            .unwrap_or_else(|e| env.panic_with_error(e));
         let net_acbu = acbu_amount
             .checked_sub(fee)
             .expect("Underflow in net acbu calculation");
@@ -204,10 +220,20 @@ impl BurningContract {
             .and_then(|v| v.checked_div(rate))
             .expect("Overflow in stoken out calculation");
 
+        // Slippage guard: reject before any state change if output is below caller's floor.
+        if let Some(floor) = min_stoken_out {
+            if stoken_out < floor {
+                env.panic_with_error(ContractError::SlippageExceeded);
+            }
+        }
+
+        // AC-008: same guard as redeem_basket around the value-moving calls.
+        reentrancy_guard::acquire_guard(&env);
         Self::check_reserves(&env, &acbu_token, &reserve_tracker_addr);
 
         let acbu_client = soroban_sdk::token::Client::new(&env, &acbu_token);
         acbu_client.burn(&user, &acbu_amount);
+        Self::notify_minting_burn(&env, acbu_amount);
 
         let token = soroban_sdk::token::Client::new(&env, &stoken);
         let spender = env.current_contract_address();
@@ -228,23 +254,38 @@ impl BurningContract {
         env.events()
             .publish((symbol_short!("burn"), user), burn_event);
 
-
+        reentrancy_guard::release_guard(&env);
         stoken_out
     }
 
     /// Redeem ACBU for proportional Afreum S-tokens across the basket (lower fee tier).
+    ///
+    /// `min_stokens_out` is an optional per-leg slippage guard: if provided, its
+    /// length must equal the number of basket currencies and each element is the
+    /// minimum acceptable S-token amount for that leg. The transaction reverts
+    /// with `SlippageExceeded` before any ACBU is burned if any leg's computed
+    /// output falls below the corresponding floor. Pass `None` to disable all
+    /// per-leg checks (backwards-compatible default).
     pub fn redeem_basket(
         env: Env,
         user: Address,
         recipients: Vec<Address>,
         acbu_amount: i128,
+        min_stokens_out: Option<Vec<i128>>,
     ) -> Vec<i128> {
-        Self::check_paused(&env);
+        Self::check_circuit(&env);
         user.require_auth();
         Self::extend_instance_ttl(&env);
 
         if recipients.is_empty() {
             env.panic_with_error(ContractError::InvalidRecipient);
+        }
+
+        // Validate min_stokens_out length before doing any heavy computation.
+        if let Some(ref floors) = min_stokens_out {
+            if floors.len() != recipients.len() {
+                env.panic_with_error(ContractError::InvalidAmount);
+            }
         }
 
         for i in 0..recipients.len() {
@@ -317,7 +358,8 @@ impl BurningContract {
             env.panic_with_error(ContractError::InvalidRate);
         }
 
-        let total_fee = calculate_fee(acbu_amount, fee_rate);
+        let total_fee = calculate_fee(acbu_amount, fee_rate)
+            .unwrap_or_else(|e| env.panic_with_error(e));
         let net_acbu = acbu_amount
             .checked_sub(total_fee)
             .expect("Underflow in net acbu");
@@ -326,11 +368,67 @@ impl BurningContract {
             .and_then(|v| v.checked_div(DECIMALS))
             .expect("Overflow in usd total");
 
-        reentrancy_guard::acquire_guard(&env);
+        // Pre-flight slippage check — runs before any state change so the
+        // transaction reverts cleanly without burning ACBU first.
+        if let Some(ref floors) = min_stokens_out {
+            let mut pf_last_positive: Option<u32> = None;
+            for i in 0..weights.len() {
+                if weights.get(i).unwrap() > 0 {
+                    pf_last_positive = Some(i);
+                }
+            }
+            let mut pf_allocated_usd = 0i128;
+            let mut pf_allocated_gross = 0i128;
+            let mut pf_allocated_fee = 0i128;
+            for i in 0..currencies.len() {
+                let currency = currencies.get(i).unwrap();
+                let weight = weights.get(i).unwrap();
+                if weight == 0 {
+                    continue;
+                }
+                let (rate, _): (i128, u64) = env.invoke_contract(
+                    &oracle_addr,
+                    &Symbol::new(&env, ORACLE_GET_RATE_WITH_TS),
+                    vec![&env, currency.clone().into_val(&env)],
+                );
+                if rate <= 0 {
+                    env.panic_with_error(ContractError::InvalidRate);
+                }
+                let (pf_usd_i, pf_gross_i, pf_fee_i) = if pf_last_positive == Some(i) {
+                    (
+                        usd_total.checked_sub(pf_allocated_usd).expect("pf usd"),
+                        acbu_amount.checked_sub(pf_allocated_gross).expect("pf gross"),
+                        total_fee.checked_sub(pf_allocated_fee).expect("pf fee"),
+                    )
+                } else {
+                    (
+                        Self::weighted_floor(usd_total, weight, total_weight),
+                        Self::weighted_floor(acbu_amount, weight, total_weight),
+                        Self::weighted_floor(total_fee, weight, total_weight),
+                    )
+                };
+                pf_allocated_usd = pf_allocated_usd.checked_add(pf_usd_i).expect("pf alloc usd");
+                pf_allocated_gross = pf_allocated_gross.checked_add(pf_gross_i).expect("pf alloc gross");
+                pf_allocated_fee = pf_allocated_fee.checked_add(pf_fee_i).expect("pf alloc fee");
+                let pf_net_i = pf_gross_i.checked_sub(pf_fee_i).expect("pf net");
+                let pf_native_i = pf_net_i
+                    .checked_mul(acbu_rate)
+                    .and_then(|v| v.checked_div(rate))
+                    .expect("pf native");
+                if let Some(floor) = floors.get(i) {
+                    if pf_native_i < floor {
+                        env.panic_with_error(ContractError::SlippageExceeded);
+                    }
+                }
+            }
+        }
+
+        let _guard = reentrancy_guard::acquire_guard(&env);
         Self::check_reserves(&env, &acbu_token, &reserve_tracker_addr);
 
         let acbu_client = soroban_sdk::token::Client::new(&env, &acbu_token);
         acbu_client.burn(&user, &acbu_amount);
+        Self::notify_minting_burn(&env, acbu_amount);
 
         let mut last_positive_weight_index: Option<u32> = None;
         for i in 0..weights.len() {
@@ -433,7 +531,6 @@ impl BurningContract {
                 .publish((symbol_short!("burn"), user.clone()), burn_event);
         }
 
-        reentrancy_guard::release_guard(&env);
         amounts_out
     }
 
@@ -556,7 +653,63 @@ impl BurningContract {
             .get(&DATA_KEY.pending_admin_eligible_at)
     }
 
+    /// Link circuit-breaker peers (admin only, AC-030).
+    ///
+    /// While any peer's `is_paused()` returns `true` — or a peer cannot be
+    /// queried — every redemption path reverts with `Paused`, exactly as if this
+    /// contract were paused. Link the minting contract and the reserve tracker
+    /// here (and this contract on their side) so tripping any one breaker stops
+    /// value movement end to end. Pass an empty list to unlink. At most
+    /// `MAX_CIRCUIT_PEERS` entries; duplicates and this contract are rejected.
+    pub fn set_circuit_peers(env: Env, peers: Vec<Address>) {
+        let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
+        admin.require_auth();
+        Self::extend_instance_ttl(&env);
+        if let Err(e) = validate_circuit_peers(&env, &peers) {
+            env.panic_with_error(e);
+        }
+        env.storage().instance().set(&DATA_KEY.circuit_peers, &peers);
+        env.events()
+            .publish((symbol_short!("cb_peers"),), peers);
+    }
+
+    /// Link the minting contract whose supply tracker is decremented on every
+    /// burn (admin only, AC-005). The minting side must link this contract via
+    /// its `set_burning_contract` for the notification to be accepted.
+    pub fn set_minting_contract(env: Env, minting_contract: Address) {
+        Self::check_admin(&env);
+        Self::extend_instance_ttl(&env);
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.minting_contract, &minting_contract);
+        env.events()
+            .publish((symbol_short!("mint_ctr"),), minting_contract);
+    }
+
+    /// Return the linked minting contract, if any.
+    pub fn get_minting_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DATA_KEY.minting_contract)
+    }
+
+    /// Return the linked circuit-breaker peers (empty if none).
+    pub fn get_circuit_peers(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DATA_KEY.circuit_peers)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Returns `true` if redemption is halted: this contract is paused or any
+    /// linked circuit-breaker peer is paused (or unreachable).
+    pub fn is_halted(env: Env) -> bool {
+        let peers = Self::get_circuit_peers(env.clone());
+        Self::is_paused(env.clone()) || any_circuit_peer_paused(&env, &peers)
+    }
+
     /// Returns `true` if the contract is currently paused.
+    ///
+    /// Reports **local** state only: circuit-breaker peers call this on each
+    /// other, so it must never query peers itself. See [`Self::is_halted`].
     pub fn is_paused(env: Env) -> bool {
         let phase: ContractPhase = env
             .storage()
@@ -696,6 +849,19 @@ impl BurningContract {
         }
     }
 
+    /// Report a burn to the linked minting contract so its tracked supply is
+    /// decremented (AC-005). No-op while no minting contract is linked.
+    fn notify_minting_burn(env: &Env, acbu_amount: i128) {
+        let minting: Option<Address> = env.storage().instance().get(&DATA_KEY.minting_contract);
+        if let Some(minting) = minting {
+            env.invoke_contract::<()>(
+                &minting,
+                &Symbol::new(env, MINTING_RECORD_BURN),
+                vec![env, acbu_amount.into_val(env)],
+            );
+        }
+    }
+
     fn check_paused(env: &Env) {
         let phase: ContractPhase = env
             .storage()
@@ -703,6 +869,20 @@ impl BurningContract {
             .get(&DATA_KEY.phase)
             .unwrap_or(ContractPhase::Active);
         if matches!(phase, ContractPhase::Paused) {
+            env.panic_with_error(ContractError::Paused);
+        }
+    }
+
+    /// Guard for value-moving paths: local pause plus every circuit-breaker
+    /// peer (AC-030).
+    fn check_circuit(env: &Env) {
+        Self::check_paused(env);
+        let peers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DATA_KEY.circuit_peers)
+            .unwrap_or(Vec::new(env));
+        if any_circuit_peer_paused(env, &peers) {
             env.panic_with_error(ContractError::Paused);
         }
     }

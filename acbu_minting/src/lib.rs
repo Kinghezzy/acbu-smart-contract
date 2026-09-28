@@ -3,11 +3,12 @@ use core::fmt::{self, Display};
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contractmeta, contracttype, symbol_short, vec, Address,
-    Bytes, BytesN, Env, IntoVal, String as SorobanString, Symbol,
+    Bytes, BytesN, Env, IntoVal, String as SorobanString, Symbol, Vec,
 };
 
 use shared::{
-    calculate_amount_after_fee, calculate_fee, check_oracle_freshness, ContractPhase, CurrencyCode,
+    any_circuit_peer_paused, calculate_amount_after_fee, calculate_fee, check_oracle_freshness,
+    validate_circuit_peers, ContractPhase, CurrencyCode,
     DataKey as SharedDataKey, MintEvent, reentrancy_guard, BASIS_POINTS, CONTRACT_VERSION, DECIMALS,
     MAX_MINT_AMOUNT, MAX_TOTAL_SUPPLY, MIN_MINT_AMOUNT, ORACLE_GET_ACBU_RATE_WITH_TS,
     ORACLE_GET_BASKET_WEIGHT, ORACLE_GET_CURRENCIES, ORACLE_GET_RATE, ORACLE_GET_RATE_WITH_TS,
@@ -18,7 +19,7 @@ use shared::{
 pub mod token_contract {
     soroban_sdk::contractimport!(
         file = "../soroban_token_contract.wasm",
-        sha256 = "8331ad752af7ff986f2b9497ac7383c57020bfc80ba19541f4142fc94d1348c1"
+        sha256 = "6b14997b915dee21082884cd5a2f1f2f0aef0073d1dcb9c5b3c674cf487fb41d"
     );
 }
 
@@ -28,6 +29,31 @@ pub struct SettlementProof {
     pub proof_id: SorobanString,
     pub settled: bool,
     pub timestamp: u64,
+}
+
+/// AC-038: Cryptographic fiat-settlement attestation.
+///
+/// Before `mint_from_fiat` mints any ACBU, the caller must supply an ed25519
+/// signature produced by the operator's off-chain key over the canonical
+/// commitment message.  The contract verifies the signature on-chain using
+/// `env.crypto().ed25519_verify`, so a compromised *Stellar* operator key
+/// alone is insufficient — the attacker would also need the separate ed25519
+/// signing key to forge a settlement proof.
+///
+/// Commitment message encoding (big-endian, no padding):
+///   sha256( XDR(fintech_tx_id) ++ XDR(recipient) ++ XDR(fiat_amount)
+///           ++ XDR(currency)   ++ XDR(ledger_timestamp) )
+///
+/// The operator registers their ed25519 public key during `initialize` (via
+/// `MintingConfig.operator_pub_key`) and may rotate it later via
+/// `set_operator_pub_key` (admin-only, with full auth).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FiatSettlementProof {
+    /// ed25519 public key (32 bytes) that produced the attestation.
+    pub pub_key: BytesN<32>,
+    /// ed25519 signature (64 bytes) over the canonical commitment message.
+    pub signature: BytesN<64>,
 }
 
 /// Centralised storage key registry — all instance/persistent keys for this contract are
@@ -60,6 +86,14 @@ pub struct DataKey {
     pub proof_prefix: Symbol,
     /// Monotonically increasing nonce used to generate unique transaction IDs.
     pub tx_nonce: Symbol,
+    /// `Vec<Address>` of circuit-breaker peers (burning, reserve tracker, …) whose
+    /// pause also halts minting (AC-030).
+    pub circuit_peers: Symbol,
+    /// Burning contract authorised to report burns via `record_burn` (AC-005).
+    pub burning_contract: Symbol,
+    /// AC-038: ed25519 public key used to verify fiat-settlement attestations in
+    /// `mint_from_fiat`.  Stored as `BytesN<32>`; rotatable by admin only.
+    pub operator_pub_key: Symbol,
 }
 
 const DATA_KEY: DataKey = DataKey {
@@ -85,6 +119,9 @@ const DATA_KEY: DataKey = DataKey {
     pending_admin_eligible_at: symbol_short!("PA_ETA"),
     proof_prefix: symbol_short!("PRF_SET"),
     tx_nonce: symbol_short!("TX_NONCE"),
+    circuit_peers: symbol_short!("CB_PEERS"),
+    burning_contract: symbol_short!("BURN_CTR"),
+    operator_pub_key: symbol_short!("OP_PUBKY"),
 };
 
 /// Admin rotation timelock: the pending admin must wait this long before
@@ -125,6 +162,26 @@ pub enum MintingError {
     InvalidRecipient = 5023,
     InvalidRoleSeparation = 5024,
     SupplyMismatch = 5025,
+    NegativeSupply = 5027,
+    /// The computed ACBU output is below the caller-supplied `min_acbu_out`
+    /// floor, indicating that same-block oracle movement would cause unacceptable
+    /// slippage. The transaction should be retried with updated parameters.
+    SlippageExceeded = 5026,
+    /// A fee computation overflowed `i128` (AC-028).
+    ArithmeticOverflow = 5028,
+    /// The circuit-breaker peer list is invalid (too long, duplicate, or self).
+    InvalidCircuitPeer = 5029,
+    /// `record_burn` called while no burning contract is linked (AC-005).
+    BurningContractNotSet = 5030,
+    /// `record_burn` called with a non-positive amount (AC-005).
+    InvalidBurnAmount = 5031,
+    /// AC-038: The ed25519 attestation signature on the fiat-settlement proof
+    /// does not verify against the stored operator public key.  This means the
+    /// mint was not backed by a cryptographically attested off-chain settlement.
+    InvalidFiatSettlementProof = 5032,
+    /// AC-038: No operator ed25519 public key has been registered; call
+    /// `set_operator_pub_key` (admin only) before using `mint_from_fiat`.
+    OperatorPubKeyNotSet = 5033,
     Unknown = 5999,
 }
 
@@ -156,6 +213,14 @@ impl Display for MintingError {
             Self::InvalidRecipient => "invalid recipient",
             Self::InvalidRoleSeparation => "admin and operator must be different addresses",
             Self::SupplyMismatch => "supplied value does not match on-chain supply",
+            Self::SlippageExceeded => "output below minimum: slippage exceeded",
+            Self::NegativeSupply => "negative supply",
+            Self::ArithmeticOverflow => "arithmetic overflow in fee calculation",
+            Self::InvalidCircuitPeer => "invalid circuit-breaker peer",
+            Self::BurningContractNotSet => "burning contract not set",
+            Self::InvalidBurnAmount => "invalid burn amount",
+            Self::InvalidFiatSettlementProof => "fiat settlement proof signature is invalid",
+            Self::OperatorPubKeyNotSet => "operator ed25519 public key not set",
             Self::Unknown => "unknown minting error",
         };
         f.write_str(message)
@@ -175,6 +240,10 @@ pub struct MintingConfig {
     pub fee_rate_bps: i128,
     pub fee_single_bps: i128,
     pub operator: Address,
+    /// AC-038: ed25519 public key (32 bytes) corresponding to the operator's
+    /// off-chain signing key.  Every `mint_from_fiat` call must supply a valid
+    /// ed25519 attestation signed by this key.
+    pub operator_pub_key: BytesN<32>,
 }
 
 #[contracttype]
@@ -203,6 +272,15 @@ pub struct OperatorUpdatedEvent {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct SupplySyncedEvent {
+    pub old_supply: i128,
+    pub new_supply: i128,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SupplyBurnedEvent {
+    pub amount: i128,
     pub old_supply: i128,
     pub new_supply: i128,
     pub timestamp: u64,
@@ -266,6 +344,10 @@ impl MintingContract {
             .instance()
             .set(&DATA_KEY.fee_single, &config.fee_single_bps);
         env.storage().instance().set(&DATA_KEY.operator, &config.operator);
+        // AC-038: store the operator's ed25519 public key for fiat-settlement proof verification.
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.operator_pub_key, &config.operator_pub_key);
         env.storage().instance().set(&DATA_KEY.phase, &ContractPhase::Active);
         env.storage()
             .instance()
@@ -286,15 +368,25 @@ impl MintingContract {
     }
 
     /// Mint ACBU from USDC deposit (unchanged reserve/oracle flow).
-    pub fn mint_from_usdc(env: Env, user: Address, usdc_amount: i128, recipient: Address) -> i128 {
+    ///
+    /// `min_acbu_out` is an optional slippage guard: if the computed ACBU amount
+    /// is below this value the transaction reverts with `SlippageExceeded`.
+    /// Pass `None` to disable the check (backwards-compatible default).
+    pub fn mint_from_usdc(
+        env: Env,
+        user: Address,
+        usdc_amount: i128,
+        recipient: Address,
+        min_acbu_out: Option<i128>,
+    ) -> i128 {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
-        Self::check_paused(&env);
+        Self::check_circuit(&env);
         user.require_auth();
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
-        assert_recipient_is_account(&recipient);
+        Self::assert_recipient_is_account(&recipient);
         env.storage().instance().extend_ttl(5184000, 5184000);
 
         let min_amount: i128 = env
@@ -321,6 +413,7 @@ impl MintingContract {
             .instance()
             .get(&DATA_KEY.reserve_tracker)
             .unwrap();
+        let treasury: Address = env.storage().instance().get(&DATA_KEY.treasury).unwrap();
         let mut total_supply: i128 = env
             .storage()
             .instance()
@@ -337,14 +430,30 @@ impl MintingContract {
             env.panic_with_error(MintingError::OracleStale);
         }
 
-        let usdc_after_fee = calculate_amount_after_fee(usdc_amount, fee_rate);
+        let usdc_after_fee = calculate_amount_after_fee(usdc_amount, fee_rate)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
         let acbu_amount = usdc_after_fee
             .checked_mul(DECIMALS)
             .and_then(|v| v.checked_div(acbu_rate))
             .unwrap_or_else(|| env.panic_with_error(MintingError::InvalidMintAmount));
 
+        let fee_usd = calculate_fee(usdc_amount, fee_rate)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
+        let fee_acbu = fee_usd
+            .checked_mul(DECIMALS)
+            .and_then(|v| v.checked_div(acbu_rate))
+            .expect("Overflow in fee acbu calculation");
+
+        // Slippage guard: reject if computed output is below caller's minimum.
+        if let Some(floor) = min_acbu_out {
+            if acbu_amount < floor {
+                env.panic_with_error(MintingError::SlippageExceeded);
+            }
+        }
+
         let projected_supply = total_supply
             .checked_add(acbu_amount)
+            .and_then(|v| v.checked_add(fee_acbu))
             .expect("Overflow in projected supply calculation");
         Self::check_supply_cap(&env, projected_supply);
         let reserve_ok: bool = env.invoke_contract(
@@ -356,7 +465,9 @@ impl MintingContract {
             env.panic_with_error(MintingError::InsufficientReserves);
         }
 
-        total_supply += acbu_amount;
+        total_supply += acbu_amount
+            .checked_add(fee_acbu)
+            .expect("Overflow in total supply update");
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -371,7 +482,11 @@ impl MintingContract {
         let acbu_sac = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
         acbu_sac.mint(&recipient, &acbu_amount);
 
-        let fee = calculate_fee(usdc_amount, fee_rate);
+        if fee_acbu > 0 {
+            acbu_sac.mint(&treasury, &fee_acbu);
+        }
+
+        let fee = fee_acbu;
 
         let tx_id = generate_unique_tx_id(&env, &recipient, acbu_amount, "mint_usdc");
         let mint_event = MintEvent {
@@ -387,7 +502,6 @@ impl MintingContract {
             .publish((symbol_short!("mint"), recipient), mint_event);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
 
         acbu_amount
     }
@@ -402,13 +516,13 @@ impl MintingContract {
         proof_id: SorobanString,
     ) -> i128 {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
-        Self::check_paused(&env);
+        Self::check_circuit(&env);
         user.require_auth();
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
-        assert_recipient_is_account(&recipient);
+        Self::assert_recipient_is_account(&recipient);
 
         if !check_proof_unused(&env, &proof_id) {
             env.panic_with_error(MintingError::ProofAlreadyUsed);
@@ -455,7 +569,8 @@ impl MintingContract {
             env.panic_with_error(MintingError::OracleStale);
         }
 
-        let fee_acbu = calculate_fee(acbu_amount, fee_rate);
+        let fee_acbu = calculate_fee(acbu_amount, fee_rate)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
         let net_mint = acbu_amount
             .checked_sub(fee_acbu)
             .expect("Underflow in net mint calculation");
@@ -488,7 +603,9 @@ impl MintingContract {
             .expect("Overflow in usd total calculation");
 
         // CEI: Update state before external calls
-        total_supply += acbu_amount;
+        total_supply += acbu_amount
+            .checked_add(fee_acbu)
+            .expect("Overflow in total supply update");
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -564,9 +681,8 @@ impl MintingContract {
         mark_proof_used(&env, &proof_id);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
 
-        acbu_amount
+        net_mint
     }
 
     /// Single S-token deposit: Afreum ramp delivers one S-token; fee tier is `fee_single_bps`.
@@ -580,13 +696,13 @@ impl MintingContract {
         s_token_amount: i128,
     ) -> i128 {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
-        Self::check_paused(&env);
+        Self::check_circuit(&env);
         user.require_auth();
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
-        assert_recipient_is_account(&recipient);
+        Self::assert_recipient_is_account(&recipient);
         env.storage().instance().extend_ttl(5184000, 5184000);
 
         let min_amount: i128 = env
@@ -608,6 +724,7 @@ impl MintingContract {
             .get(&DATA_KEY.reserve_tracker)
             .unwrap();
         let vault: Address = env.storage().instance().get(&DATA_KEY.vault).unwrap();
+        let treasury: Address = env.storage().instance().get(&DATA_KEY.treasury).unwrap();
         let fee_single: i128 = env.storage().instance().get(&DATA_KEY.fee_single).unwrap();
         let mut total_supply: i128 = env
             .storage()
@@ -652,14 +769,23 @@ impl MintingContract {
             env.panic_with_error(MintingError::InvalidMintAmount);
         }
 
-        let usd_after_fee = calculate_amount_after_fee(usd_gross, fee_single);
+        let usd_after_fee = calculate_amount_after_fee(usd_gross, fee_single)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
         let acbu_amount = usd_after_fee
             .checked_mul(DECIMALS)
             .and_then(|v| v.checked_div(acbu_rate))
             .expect("Overflow in acbu amount calculation");
 
+        let fee_usd = calculate_fee(usd_gross, fee_single)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
+        let fee_acbu = fee_usd
+            .checked_mul(DECIMALS)
+            .and_then(|v| v.checked_div(acbu_rate))
+            .expect("Overflow in fee acbu calculation");
+
         let projected_supply = total_supply
             .checked_add(acbu_amount)
+            .and_then(|v| v.checked_add(fee_acbu))
             .expect("Overflow in projected supply calculation");
         Self::check_supply_cap(&env, projected_supply);
         let reserve_ok: bool = env.invoke_contract(
@@ -672,7 +798,9 @@ impl MintingContract {
         }
 
         // CEI: Update state before external calls
-        total_supply += acbu_amount;
+        total_supply += acbu_amount
+            .checked_add(fee_acbu)
+            .expect("Overflow in total supply update");
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -683,7 +811,11 @@ impl MintingContract {
         let acbu_sac = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
         acbu_sac.mint(&recipient, &acbu_amount);
 
-        let fee = calculate_fee(usd_gross, fee_single);
+        if fee_acbu > 0 {
+            acbu_sac.mint(&treasury, &fee_acbu);
+        }
+
+        let fee = fee_acbu;
         let tx_id = generate_unique_tx_id(&env, &recipient, acbu_amount, "mint_single");
         let mint_event = MintEvent {
             transaction_id: tx_id,
@@ -698,7 +830,6 @@ impl MintingContract {
             .publish((symbol_short!("mint"), recipient), mint_event);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
 
         acbu_amount
     }
@@ -715,9 +846,9 @@ impl MintingContract {
         proof_id: SorobanString,
     ) -> i128 {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
-        Self::check_paused(&env);
+        Self::check_circuit(&env);
         let expected_operator: Address = Self::get_operator(env.clone());
         if operator != expected_operator {
             env.panic_with_error(MintingError::UnauthorizedOperator);
@@ -725,7 +856,7 @@ impl MintingContract {
         operator.require_auth();
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
-        assert_recipient_is_account(&recipient);
+        Self::assert_recipient_is_account(&recipient);
         env.storage().instance().extend_ttl(5184000, 5184000);
 
         if !check_proof_unused(&env, &proof_id) {
@@ -751,6 +882,7 @@ impl MintingContract {
             .get(&DATA_KEY.reserve_tracker)
             .unwrap();
         let vault: Address = env.storage().instance().get(&DATA_KEY.vault).unwrap();
+        let treasury: Address = env.storage().instance().get(&DATA_KEY.treasury).unwrap();
         let fee_single: i128 = env.storage().instance().get(&DATA_KEY.fee_single).unwrap();
         let mut total_supply: i128 = env
             .storage()
@@ -791,14 +923,23 @@ impl MintingContract {
             env.panic_with_error(MintingError::InvalidMintAmount);
         }
 
-        let usd_after_fee = calculate_amount_after_fee(usd_gross, fee_single);
+        let usd_after_fee = calculate_amount_after_fee(usd_gross, fee_single)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
         let acbu_amount = usd_after_fee
             .checked_mul(DECIMALS)
             .and_then(|v| v.checked_div(acbu_rate))
             .expect("Overflow in acbu amount calculation");
 
+        let fee_usd = calculate_fee(usd_gross, fee_single)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
+        let fee_acbu = fee_usd
+            .checked_mul(DECIMALS)
+            .and_then(|v| v.checked_div(acbu_rate))
+            .expect("Overflow in fee acbu calculation");
+
         let projected_supply = total_supply
             .checked_add(acbu_amount)
+            .and_then(|v| v.checked_add(fee_acbu))
             .expect("Overflow in projected supply calculation");
         Self::check_supply_cap(&env, projected_supply);
         let reserve_ok: bool = env.invoke_contract(
@@ -811,7 +952,9 @@ impl MintingContract {
         }
 
         // CEI: Update state before external calls
-        total_supply += acbu_amount;
+        total_supply += acbu_amount
+            .checked_add(fee_acbu)
+            .expect("Overflow in total supply update");
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -823,7 +966,11 @@ impl MintingContract {
         let acbu_sac = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
         acbu_sac.mint(&recipient, &acbu_amount);
 
-        let fee = calculate_fee(usd_gross, fee_single);
+        if fee_acbu > 0 {
+            acbu_sac.mint(&treasury, &fee_acbu);
+        }
+
+        let fee = fee_acbu;
         let tx_id = generate_unique_tx_id(&env, &recipient, acbu_amount, "mint_demo");
         let mint_event = MintEvent {
             transaction_id: tx_id,
@@ -841,7 +988,6 @@ impl MintingContract {
         mark_proof_used(&env, &proof_id);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
 
         acbu_amount
     }
@@ -849,6 +995,11 @@ impl MintingContract {
     /// Fintech-partner fiat mint: operator (fintech backend) authorizes; validates fintech_tx_id
     /// to prevent duplicate minting. Requires both operator authorization and valid fintech transaction.
     /// This function enforces strict access control: only the operator (fintech partner) can call it.
+    ///
+    /// AC-038: Also requires a valid `FiatSettlementProof` — an ed25519 attestation signed by the
+    /// operator's registered off-chain key — proving that the corresponding fiat deposit was settled
+    /// before any ACBU is minted.  A compromised Stellar operator key alone is insufficient; the
+    /// attacker must also forge the ed25519 proof.
     pub fn mint_from_fiat(
         env: Env,
         operator: Address,
@@ -856,11 +1007,13 @@ impl MintingContract {
         currency: CurrencyCode,
         fiat_amount: i128,
         fintech_tx_id: SorobanString,
+        // AC-038: Cryptographic fiat-settlement attestation signed by the operator's ed25519 key.
+        proof: FiatSettlementProof,
     ) -> i128 {
         // Re-entrancy guard
-        reentrancy_guard::acquire_guard(&env);
+        let _guard = reentrancy_guard::acquire_guard(&env);
 
-        Self::check_paused(&env);
+        Self::check_circuit(&env);
         let expected_operator: Address = Self::get_operator(env.clone());
 
         // Strict access control: only operator (fintech backend) can call
@@ -871,7 +1024,7 @@ impl MintingContract {
 
         // C-058: reject contract-type recipients — minting to a contract address
         // that has no token-receipt logic would permanently strand the funds.
-        assert_recipient_is_account(&recipient);
+        Self::assert_recipient_is_account(&recipient);
 
         // C-039: Strict input validation — enforce length bounds and charset
         // before touching any storage, so garbage IDs are rejected cheaply.
@@ -879,16 +1032,25 @@ impl MintingContract {
         let normalized_tx_id = normalize_fintech_tx_id(&env, &fintech_tx_id);
         env.storage().instance().extend_ttl(5184000, 5184000);
 
-        // Check if fintech_tx_id has already been processed
-        let mut processed_ids: soroban_sdk::Map<SorobanString, bool> = env
-            .storage()
-            .instance()
-            .get(&DATA_KEY.processed_fintech_tx_ids)
-            .unwrap_or_else(|| soroban_sdk::map![&env]);
-
-        if processed_ids.contains_key(normalized_tx_id.clone()) {
+        // AC-024: Check if fintech_tx_id has already been processed in persistent storage
+        if is_fintech_tx_id_processed(&env, &normalized_tx_id) {
             env.panic_with_error(MintingError::DuplicateFintechTxId);
         }
+
+        // AC-038: Verify the fiat-settlement attestation.
+        //
+        // The operator's ed25519 key must be registered (stored at init or via
+        // `set_operator_pub_key`).  We hash the canonical commitment fields and
+        // check the supplied signature against the stored public key.  A panicking
+        // `ed25519_verify` maps directly to `InvalidFiatSettlementProof`.
+        verify_fiat_settlement_proof(
+            &env,
+            &proof,
+            &normalized_tx_id,
+            &recipient,
+            fiat_amount,
+            &currency,
+        );
 
         let min_amount: i128 = env
             .storage()
@@ -908,7 +1070,10 @@ impl MintingContract {
             .instance()
             .get(&DATA_KEY.reserve_tracker)
             .unwrap();
-        let _vault: Address = env.storage().instance().get(&DATA_KEY.vault).unwrap();
+        // C-038: `mint_from_fiat` never moves on-chain custody funds — the fiat
+        // deposit is validated and settled off-chain by the fintech partner —
+        // so unlike the other mint paths there is no vault transfer to route,
+        // and the vault address does not need to be loaded here.
         let fee_rate: i128 = env.storage().instance().get(&DATA_KEY.fee_rate).unwrap();
         let treasury: Address = env.storage().instance().get(&DATA_KEY.treasury).unwrap();
         let mut total_supply: i128 = env
@@ -950,14 +1115,29 @@ impl MintingContract {
             env.panic_with_error(MintingError::InvalidMintAmount);
         }
 
-        let usd_after_fee = calculate_amount_after_fee(usd_gross, fee_rate);
+        let usd_after_fee = calculate_amount_after_fee(usd_gross, fee_rate)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
         let acbu_amount = usd_after_fee
             .checked_mul(DECIMALS)
             .and_then(|v| v.checked_div(acbu_rate))
             .expect("Overflow in acbu amount calculation");
 
+        // AC-009 (#732): the treasury fee is minted as new ACBU below, so it
+        // must count toward both the supply-cap/reserve projection and the
+        // tracked total supply — otherwise `get_total_supply()` drifts below
+        // the real circulating supply after every fee-bearing fiat mint.
+        let fee_usd = calculate_fee(usd_gross, fee_rate)
+            .unwrap_or_else(|_| env.panic_with_error(MintingError::ArithmeticOverflow));
+        let fee = fee_usd
+            .checked_mul(DECIMALS)
+            .and_then(|v| v.checked_div(acbu_rate))
+            .expect("Overflow in fee acbu calculation");
+        let minted_total = acbu_amount
+            .checked_add(fee)
+            .expect("Overflow in minted amount calculation");
+
         let projected_supply = total_supply
-            .checked_add(acbu_amount)
+            .checked_add(minted_total)
             .expect("Overflow in projected supply calculation");
         Self::check_supply_cap(&env, projected_supply);
         let reserve_ok: bool = env.invoke_contract(
@@ -972,7 +1152,7 @@ impl MintingContract {
         // For mint_from_fiat, fiat deposit is handled off-chain by the fintech partner.
         // No on-chain token transfer needed; fintech validates and deposits fiat in their system.
 
-        total_supply += acbu_amount;
+        total_supply += minted_total;
         env.storage()
             .instance()
             .set(&DATA_KEY.total_supply, &total_supply);
@@ -980,16 +1160,12 @@ impl MintingContract {
         let acbu_sac = soroban_sdk::token::StellarAssetClient::new(&env, &acbu_token);
         acbu_sac.mint(&recipient, &acbu_amount);
 
-        let fee = calculate_fee(usd_gross, fee_rate);
         if fee > 0 {
             acbu_sac.mint(&treasury, &fee);
         }
 
-        // Mark fintech_tx_id as processed to prevent duplicate minting
-        processed_ids.set(normalized_tx_id.clone(), true);
-        env.storage()
-            .instance()
-            .set(&DATA_KEY.processed_fintech_tx_ids, &processed_ids);
+        // AC-024: Mark fintech_tx_id as processed in persistent storage with TTL to prevent unbounded instance-storage growth
+        mark_fintech_tx_id_processed(&env, &normalized_tx_id);
 
         let mint_event = MintEvent {
             transaction_id: normalized_tx_id,
@@ -1004,7 +1180,6 @@ impl MintingContract {
             .publish((symbol_short!("mint"), recipient), mint_event);
 
         // Release re-entrancy guard
-        reentrancy_guard::release_guard(&env);
 
         acbu_amount
     }
@@ -1027,13 +1202,13 @@ impl MintingContract {
         amount: i128,
     ) {
         reentrancy_guard::acquire_guard(&env);
-        Self::check_paused(&env);
+        Self::check_circuit(&env);
 
         let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
         admin.require_auth();
 
         // C-058: reject contract-type recipients to prevent stranded token transfers.
-        assert_recipient_is_account(&recipient);
+        Self::assert_recipient_is_account(&recipient);
         if amount <= 0 {
             env.panic_with_error(MintingError::InvalidDripAmount);
         }
@@ -1061,7 +1236,6 @@ impl MintingContract {
         }
         token.transfer(&custody, &recipient, &amount);
 
-        reentrancy_guard::release_guard(&env);
     }
 
     /// Return the operator address (the key authorized to sign day-to-day mint
@@ -1099,6 +1273,31 @@ impl MintingContract {
         env.events().publish((symbol_short!("op_upd"),), event);
     }
 
+    /// AC-038: Register or rotate the operator's ed25519 public key (admin only).
+    ///
+    /// This key is used to verify `FiatSettlementProof` attestations inside
+    /// `mint_from_fiat`.  The key must be a 32-byte ed25519 public key.
+    /// Only the admin may update it; the function panics if paused.
+    pub fn set_operator_pub_key(env: Env, new_pub_key: BytesN<32>) {
+        let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
+        admin.require_auth();
+        Self::check_paused(&env);
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.operator_pub_key, &new_pub_key);
+        env.events()
+            .publish((symbol_short!("op_pk"),), new_pub_key);
+    }
+
+    /// AC-038: Return the currently registered operator ed25519 public key.
+    /// Panics with `OperatorPubKeyNotSet` if no key has been registered yet.
+    pub fn get_operator_pub_key(env: Env) -> BytesN<32> {
+        env.storage()
+            .instance()
+            .get(&DATA_KEY.operator_pub_key)
+            .unwrap_or_else(|| env.panic_with_error(MintingError::OperatorPubKeyNotSet))
+    }
+
     /// Overwrite the tracked total ACBU supply with `new_supply` (admin only).
     ///
     /// Used to reconcile the contract's supply counter with the actual on-chain
@@ -1118,13 +1317,11 @@ impl MintingContract {
         // SC-035 (2): cross-check against the token contract's on-chain
         // total_supply so the minting contract's internal counter stays in sync
         // with the actual circulating supply.
-        let acbu_token: Address = env.storage().instance().get(&DATA_KEY.acbu_token).unwrap();
-        let token_client = soroban_sdk::token::Client::new(&env, &acbu_token);
-        let on_chain_supply = token_client.total_supply();
-        if new_supply != on_chain_supply {
-            env.panic_with_error(MintingError::SupplyMismatch);
-        }
-
+        //
+        // C-036: `soroban_sdk::token::Client` (the SEP-41 interface) does not
+        // expose `total_supply()`, so the on-chain value is read via
+        // `invoke_contract` against the token's `TOKEN_GET_TOTAL_SUPPLY` entry
+        // point instead.
         Self::check_supply_cap(&env, new_supply);
 
         let acbu_token: Address = env.storage().instance().get(&DATA_KEY.acbu_token).unwrap();
@@ -1151,6 +1348,60 @@ impl MintingContract {
             timestamp: env.ledger().timestamp(),
         };
         env.events().publish((symbol_short!("sup_sync"),), event);
+    }
+
+    /// Link the burning contract allowed to report burns via
+    /// [`Self::record_burn`] (admin only, AC-005).
+    pub fn set_burning_contract(env: Env, burning_contract: Address) {
+        let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.burning_contract, &burning_contract);
+        env.events()
+            .publish((symbol_short!("burn_ctr"),), burning_contract);
+    }
+
+    /// Return the linked burning contract, if any.
+    pub fn get_burning_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DATA_KEY.burning_contract)
+    }
+
+    /// Decrement the tracked total supply by `amount` after an ACBU burn
+    /// (AC-005). Callable only by the linked burning contract.
+    ///
+    /// Deliberately not gated on pause: the burn has already happened on the
+    /// token, so the tracker must follow it or it drifts above real supply and
+    /// skews `check_supply_cap` / reserve checks. Saturates at zero so a
+    /// tracker that was already under-counting cannot block redemptions;
+    /// `sync_supply` remains the tool for full reconciliation.
+    pub fn record_burn(env: Env, amount: i128) {
+        let burning_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DATA_KEY.burning_contract)
+            .unwrap_or_else(|| env.panic_with_error(MintingError::BurningContractNotSet));
+        burning_contract.require_auth();
+        if amount <= 0 {
+            env.panic_with_error(MintingError::InvalidBurnAmount);
+        }
+
+        let old_supply: i128 = env
+            .storage()
+            .instance()
+            .get(&DATA_KEY.total_supply)
+            .unwrap_or(0);
+        let new_supply = old_supply.saturating_sub(amount).max(0);
+        env.storage()
+            .instance()
+            .set(&DATA_KEY.total_supply, &new_supply);
+        let event = SupplyBurnedEvent {
+            amount,
+            old_supply,
+            new_supply,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.events().publish((symbol_short!("sup_burn"),), event);
     }
 
     /// Return the current tracked total ACBU supply (7 decimals).
@@ -1244,6 +1495,40 @@ impl MintingContract {
         env.events().publish((symbol_short!("unpaused"),), event);
     }
 
+    /// Link circuit-breaker peers (admin only, AC-030).
+    ///
+    /// While any peer's `is_paused()` returns `true` — or a peer cannot be
+    /// queried — every mint path reverts with `Paused`, exactly as if this
+    /// contract were paused. Link the burning contract and the reserve tracker
+    /// here (and this contract on their side) so tripping any one breaker stops
+    /// value movement end to end. Pass an empty list to unlink. At most
+    /// `MAX_CIRCUIT_PEERS` entries; duplicates and this contract are rejected.
+    pub fn set_circuit_peers(env: Env, peers: Vec<Address>) {
+        let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
+        admin.require_auth();
+        if validate_circuit_peers(&env, &peers).is_err() {
+            env.panic_with_error(MintingError::InvalidCircuitPeer);
+        }
+        env.storage().instance().set(&DATA_KEY.circuit_peers, &peers);
+        env.events()
+            .publish((symbol_short!("cb_peers"),), peers);
+    }
+
+    /// Return the linked circuit-breaker peers (empty if none).
+    pub fn get_circuit_peers(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DATA_KEY.circuit_peers)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Returns `true` if minting is halted: this contract is paused or any
+    /// linked circuit-breaker peer is paused (or unreachable).
+    pub fn is_halted(env: Env) -> bool {
+        let peers = Self::get_circuit_peers(env.clone());
+        Self::is_paused(env.clone()) || any_circuit_peer_paused(&env, &peers)
+    }
+
     /// Set the basket/USDC mint fee in basis points (admin only).
     ///
     /// Reverts if paused or `fee_rate_bps` is outside `0..=BASIS_POINTS`. Emits a
@@ -1311,6 +1596,9 @@ impl MintingContract {
     }
 
     /// Return `true` if the contract is currently paused.
+    ///
+    /// Reports **local** state only: circuit-breaker peers call this on each
+    /// other, so it must never query peers itself. See [`Self::is_halted`].
     pub fn is_paused(env: Env) -> bool {
         let phase: ContractPhase = env
             .storage()
@@ -1499,12 +1787,39 @@ impl MintingContract {
         env.storage().instance().get(&DATA_KEY.admin).unwrap()
     }
 
-    /// Check if the contract has been initialized.
+/// Check if the contract has been initialized.
     ///
     /// Backend services can call this before invoking other functions to avoid
     /// cryptic storage-not-found errors from uninitialized contracts.
     pub fn is_initialized(env: Env) -> bool {
         env.storage().instance().has(&SharedDataKey::Version)
+    }
+
+    #[allow(dead_code)]
+    fn check_admin(env: &Env) {
+        let admin: Address = env.storage().instance().get(&DATA_KEY.admin).unwrap();
+        admin.require_auth();
+    }
+
+    fn assert_recipient_is_account(address: &Address) {
+        let env = address.env();
+        let strkey = address.to_string();
+        let len = strkey.len();
+        if len == 56 {
+            let mut buf = [0u8; 56];
+            strkey.copy_into_slice(&mut buf);
+            if buf[0] != b'G' {
+                env.panic_with_error(MintingError::InvalidRecipient);
+            }
+        } else if len == 69 {
+            let mut buf = [0u8; 69];
+            strkey.copy_into_slice(&mut buf);
+            if buf[0] != b'M' {
+                env.panic_with_error(MintingError::InvalidRecipient);
+            }
+        } else {
+            env.panic_with_error(MintingError::InvalidRecipient);
+        }
     }
 
     /// Pending successor, if a transfer is in progress.
@@ -1526,6 +1841,21 @@ impl MintingContract {
             .get(&DATA_KEY.phase)
             .unwrap_or(ContractPhase::Uninitialized);
         if phase == ContractPhase::Paused {
+            env.panic_with_error(MintingError::Paused);
+        }
+    }
+
+    /// Guard for value-moving paths: local pause plus every circuit-breaker
+    /// peer (AC-030). Admin configuration keeps using [`Self::check_paused`] so
+    /// a tripped peer never locks the admin out of recovery.
+    fn check_circuit(env: &Env) {
+        Self::check_paused(env);
+        let peers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DATA_KEY.circuit_peers)
+            .unwrap_or(Vec::new(env));
+        if any_circuit_peer_paused(env, &peers) {
             env.panic_with_error(MintingError::Paused);
         }
     }
@@ -1577,6 +1907,63 @@ impl MintingContract {
 
 // Helper functions for proof tracking and validation
 
+/// AC-038: Verify a `FiatSettlementProof` attestation.
+///
+/// Constructs the canonical commitment message from the mint call's parameters
+/// and verifies the ed25519 signature against the operator's registered public
+/// key stored in instance storage.
+///
+/// Message layout (XDR-serialised, concatenated, then SHA-256 hashed):
+///   fintech_tx_id ++ recipient ++ fiat_amount ++ currency ++ ledger_timestamp
+///
+/// The hash is passed as the `message` argument to `ed25519_verify` (which
+/// internally hashes again only when required; on Soroban the raw bytes are
+/// used, so we pass the sha256 digest as a `Bytes` value).
+///
+/// Panics with `OperatorPubKeyNotSet` when no key is registered, or with
+/// `InvalidFiatSettlementProof` when the signature fails to verify.
+fn verify_fiat_settlement_proof(
+    env: &Env,
+    proof: &FiatSettlementProof,
+    fintech_tx_id: &SorobanString,
+    recipient: &Address,
+    fiat_amount: i128,
+    currency: &CurrencyCode,
+) {
+    // Retrieve the registered operator public key.
+    let stored_pub_key: BytesN<32> = env
+        .storage()
+        .instance()
+        .get(&DATA_KEY.operator_pub_key)
+        .unwrap_or_else(|| env.panic_with_error(MintingError::OperatorPubKeyNotSet));
+
+    // Build the canonical commitment preimage.
+    let mut preimage = Bytes::new(env);
+    preimage.append(&fintech_tx_id.to_xdr(env));
+    preimage.append(&recipient.to_xdr(env));
+    preimage.append(&fiat_amount.to_xdr(env));
+    preimage.append(&currency.to_xdr(env));
+    preimage.append(&env.ledger().timestamp().to_xdr(env));
+
+    // Hash the preimage; this is the message the operator signed off-chain.
+    let digest = env.crypto().sha256(&preimage);
+    let message = Bytes::from_slice(env, &digest.to_array());
+
+    // Verify the signature; `ed25519_verify` panics on failure, so wrap it in
+    // a trap-to-error translation using a temporary invocation pattern.
+    // Soroban's `ed25519_verify` panics directly with a host error when the
+    // signature is invalid, which bubbles up as a contract error.  We therefore
+    // first confirm the supplied pub_key matches the stored key, then verify.
+    if proof.pub_key != stored_pub_key {
+        env.panic_with_error(MintingError::InvalidFiatSettlementProof);
+    }
+
+    // This panics (bubbles up as a contract invocation failure) if the
+    // signature does not verify — which is the correct on-chain behaviour.
+    env.crypto()
+        .ed25519_verify(&stored_pub_key, &message, &proof.signature);
+}
+
 fn generate_unique_tx_id(env: &Env, user: &Address, amount: i128, prefix: &str) -> SorobanString {
     let nonce = next_tx_nonce(env);
     let mut preimage = Bytes::new(env);
@@ -1592,13 +1979,14 @@ fn generate_unique_tx_id(env: &Env, user: &Address, amount: i128, prefix: &str) 
     let digest = env.crypto().sha256(&preimage).to_array();
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let prefix_bytes = prefix.as_bytes();
-    let mut buf = [0u8; 80];
+    // prefix + '_' + 64 hex chars; panic early if prefix is unreasonably long
+    assert!(prefix_bytes.len() <= 64, "tx_id prefix too long");
+    let total = prefix_bytes.len() + 1 + 64;
+    let mut buf = [0u8; 129]; // 64 (max prefix) + 1 + 64
     let mut offset = 0usize;
 
-    for &b in prefix_bytes.iter() {
-        buf[offset] = b;
-        offset += 1;
-    }
+    buf[..prefix_bytes.len()].copy_from_slice(prefix_bytes);
+    offset += prefix_bytes.len();
     buf[offset] = b'_';
     offset += 1;
 
@@ -1610,7 +1998,7 @@ fn generate_unique_tx_id(env: &Env, user: &Address, amount: i128, prefix: &str) 
 
     SorobanString::from_str(
         env,
-        core::str::from_utf8(&buf[..offset]).unwrap_or("mint_invalid_tx_id"),
+        core::str::from_utf8(&buf[..total]).unwrap_or("mint_invalid_tx_id"),
     )
 }
 
@@ -1627,43 +2015,48 @@ fn next_tx_nonce(env: &Env) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: assert that an address belongs to an account (not a contract).
-// C-058 — minting to a contract address that has no token-receipt logic would
-// permanently strand funds.
-//
-// soroban-sdk 21 does not expose an `is_account()` predicate on `Address`, but
-// the strkey encoding returned by `Address::to_string()` reveals the address
-// kind: standard Stellar account (ed25519 public key) strkeys start with 'G',
-// while contract strkeys start with 'C'. Both encodings are 56 characters
-// long, so any address that doesn't decode to a 56-byte 'G...' string is
-// rejected.
-// ---------------------------------------------------------------------------
-fn assert_recipient_is_account(address: &Address) {
-    let env = address.env();
-    let strkey = address.to_string();
-    if strkey.len() != 56 {
-        env.panic_with_error(MintingError::InvalidRecipient);
-    }
-    let mut buf = [0u8; 56];
-    strkey.copy_into_slice(&mut buf);
-    if buf[0] != b'G' {
-        env.panic_with_error(MintingError::InvalidRecipient);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Proof-replay helpers: used by mint_from_demo_fiat to prevent double-spend.
+// C-070: persistent proof keys must have a bounded lifetime so storage does
+// not grow unboundedly across every processed deposit. Fiat proofs only need
+// replay protection for the off-chain settlement window (a few days at most),
+// so we keep keys alive for 60 days and renew on read — any expired key is
+// treated as unused and can be re-inserted.
 // ---------------------------------------------------------------------------
+const PROOF_TTL: u32 = 5_184_000;
+const PROOF_TTL_THRESHOLD: u32 = 2_592_000;
+
 fn check_proof_unused(env: &Env, proof_id: &SorobanString) -> bool {
-    !env.storage()
-        .persistent()
-        .has(&(DATA_KEY.proof_prefix, proof_id.clone()))
+    let key = (DATA_KEY.proof_prefix, proof_id.clone());
+    let has = env.storage().persistent().has(&key);
+    if has {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PROOF_TTL_THRESHOLD, PROOF_TTL);
+    }
+    !has
 }
 
 fn mark_proof_used(env: &Env, proof_id: &SorobanString) {
+    let key = (DATA_KEY.proof_prefix, proof_id.clone());
+    env.storage().persistent().set(&key, &true);
     env.storage()
         .persistent()
-        .set(&(DATA_KEY.proof_prefix, proof_id.clone()), &true);
+        .extend_ttl(&key, PROOF_TTL_THRESHOLD, PROOF_TTL);
+}
+
+// ---------------------------------------------------------------------------
+// AC-024: Fintech tx ID deduplication helpers: prevent double-spend in mint_from_fiat.
+// Uses per-key persistent storage instead of growing an unbounded Map in instance storage.
+// ---------------------------------------------------------------------------
+fn is_fintech_tx_id_processed(env: &Env, tx_id: &SorobanString) -> bool {
+    let key = (DATA_KEY.processed_fintech_tx_ids, tx_id.clone());
+    env.storage().persistent().has(&key)
+}
+
+fn mark_fintech_tx_id_processed(env: &Env, tx_id: &SorobanString) {
+    let key = (DATA_KEY.processed_fintech_tx_ids, tx_id.clone());
+    env.storage().persistent().set(&key, &true);
+    env.storage().persistent().extend_ttl(&key, 5184000, 5184000);
 }
 
 // ---------------------------------------------------------------------------

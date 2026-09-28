@@ -1,13 +1,14 @@
 #![no_std]
 use core::fmt::{self, Display};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contractmeta, contracttype, symbol_short, Address,
-    Bytes, BytesN, Env, Map, Symbol, Vec,
+    contract, contracterror, contractimpl, contractmeta, contracttype, symbol_short, vec, Address,
+    Bytes, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
 
 use shared::{
-    CurrencyCode, DataKey as SharedDataKey, ReserveData, BASIS_POINTS, CONTRACT_VERSION, DECIMALS,
-    ORACLE_GET_ACBU_RATE, ORACLE_GET_RATE_WITH_TS, TOKEN_GET_TOTAL_SUPPLY,
+    check_oracle_freshness, CurrencyCode, DataKey as SharedDataKey, ReserveData, BASIS_POINTS,
+    CONTRACT_VERSION, DECIMALS, ORACLE_GET_ACBU_RATE, ORACLE_GET_RATE_WITH_TS,
+    TOKEN_GET_TOTAL_SUPPLY, UPDATE_INTERVAL_SECONDS,
 };
 
 #[contracterror]
@@ -26,11 +27,12 @@ pub enum ReserveTrackerError {
     InvalidMerkleProof = 8009,
     InvalidCustodian = 8010,
     AttestationExpired = 8011,
-    NonPositiveAmount = 8008,
-    InconsistentReserve = 8009,
-    DuplicateCurrency = 8010,
+    NonPositiveAmount = 8014,
+    InconsistentReserve = 8015,
+    DuplicateCurrency = 8016,
     NoPendingUpgrade = 8012,
     TimelockNotElapsed = 8013,
+    OracleStale = 8017,
     Unknown = 8999,
 }
 
@@ -53,6 +55,7 @@ impl Display for ReserveTrackerError {
             Self::DuplicateCurrency => "currency already tracked",
             Self::NoPendingUpgrade => "no pending upgrade",
             Self::TimelockNotElapsed => "timelock has not elapsed",
+            Self::OracleStale => "oracle rate is stale",
             Self::Unknown => "unknown reserve tracker error",
         };
         f.write_str(message)
@@ -76,6 +79,24 @@ pub struct DataKey {
     pub pending_upgrade_wasm: Symbol,
     pub pending_upgrade_version: Symbol,
     pub pending_upgrade_eligible_at: Symbol,
+    pub custodian: Symbol,
+    pub attested_root: Symbol,
+    pub attestation_ts: Symbol,
+    /// `bool` reserve circuit breaker (AC-030).
+    pub paused: Symbol,
+}
+
+/// A single reserve entry committed in the Merkle attestation tree.
+///
+/// Each leaf encodes the currency code, the reserve amount, its USD value,
+/// and the timestamp at which the custodian attested to the balance.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttestationLeaf {
+    pub currency: CurrencyCode,
+    pub amount: i128,
+    pub value_usd: i128,
+    pub timestamp: u64,
 }
 
 const DATA_KEY: DataKey = DataKey {
@@ -93,6 +114,10 @@ const DATA_KEY: DataKey = DataKey {
     pending_upgrade_wasm: symbol_short!("PU_WASM"),
     pending_upgrade_version: symbol_short!("PU_VER"),
     pending_upgrade_eligible_at: symbol_short!("PU_ETA"),
+    custodian: symbol_short!("CUSTODIN"),
+    attested_root: symbol_short!("ATT_ROOT"),
+    attestation_ts: symbol_short!("ATT_TS"),
+    paused: symbol_short!("PAUSED"),
 };
 
 /// Admin rotation timelock: the pending admin must wait this long before
@@ -108,10 +133,26 @@ const UPGRADE_TIMELOCK_SECONDS: u64 = 86_400;
 /// Only one verify_reserves call is allowed per this cooldown period.
 const VERIFY_RESERVES_COOLDOWN_SECONDS: u64 = 60;
 
-/// Maximum age of an attestation before external systems should consider
-/// it stale. The custodian is expected to submit fresh attestations within
-/// this window. 24 hours.
+/// Maximum age of an attestation before it is considered stale and reserves
+/// are no longer trusted. The custodian is expected to submit a fresh
+/// Merkle-root attestation within this window. 24 hours.
+///
+/// Used in [`ReserveTrackerContract::is_reserve_sufficient`] to implement the
+/// AC-023 / SC-015 attestation gating: if no attestation exists, or the most
+/// recent one is older than this value, `is_reserve_sufficient` returns `false`,
+/// blocking all minting and burning until a fresh attestation is submitted.
 const ATTESTATION_MAX_AGE_SECONDS: u64 = 86_400;
+
+/// Allowed deviation between the admin-reported `value_usd` and the value
+/// derived from `amount * oracle_rate`, expressed in basis points of the
+/// derived value.  10 bps = 0.1 %.
+const RESERVE_TOLERANCE_BPS: i128 = 10;
+
+/// Minimum tolerance in 7-decimal stroops (AC-040).  `DECIMALS / 100` is
+/// 0.01 USD worth of slop, which absorbs integer-division rounding errors
+/// without allowing meaningful reserve inflation.  Without this floor the
+/// percentage-based tolerance collapses to zero for tiny reserve entries.
+const RESERVE_MIN_TOLERANCE_STROOPS: i128 = DECIMALS / 100;
 
 contractmeta!(key = "version", val = "1");
 
@@ -175,7 +216,11 @@ impl ReserveTrackerContract {
         let last_call: Option<u64> = env.storage().instance().get(&DATA_KEY.last_verify_call);
         if let Some(last) = last_call {
             if now.saturating_sub(last) < VERIFY_RESERVES_COOLDOWN_SECONDS {
-                return true;
+                let cached: Option<bool> =
+                    env.storage().instance().get(&DATA_KEY.last_verify_result);
+                if let Some(cached) = cached {
+                    return cached;
+                }
             }
         }
 
@@ -195,6 +240,7 @@ impl ReserveTrackerContract {
     /// Like [`Self::verify_reserves`] but uses the caller-supplied
     /// `total_acbu_supply` instead of querying the token contract. Returns `true`
     /// if reserves meet the minimum ratio.
+    #[allow(dead_code)]
     fn verify_reserves_manual(env: Env, total_acbu_supply: i128) -> bool {
         Self::is_reserve_sufficient(env, total_acbu_supply)
     }
@@ -222,19 +268,28 @@ impl ReserveTrackerContract {
         }
 
         let oracle_addr: Address = env.storage().instance().get(&DATA_KEY.oracle).unwrap();
-        let (rate, _rate_timestamp): (i128, u64) = env.invoke_contract(
+        let (rate, rate_timestamp): (i128, u64) = env.invoke_contract(
             &oracle_addr,
             &Symbol::new(&env, ORACLE_GET_RATE_WITH_TS),
             vec![&env, currency.clone().into_val(&env)],
         );
+
+        if !check_oracle_freshness(&env, rate_timestamp, UPDATE_INTERVAL_SECONDS) {
+            env.panic_with_error(ReserveTrackerError::OracleStale);
+        }
 
         let expected_value_usd = amount
             .checked_mul(rate)
             .and_then(|v| v.checked_div(DECIMALS))
             .expect("Overflow in reserve value calculation");
 
+        let tolerance: u128 = expected_value_usd
+            .checked_mul(RESERVE_TOLERANCE_BPS)
+            .and_then(|v| v.checked_div(BASIS_POINTS))
+            .expect("Overflow in tolerance calculation")
+            .max(RESERVE_MIN_TOLERANCE_STROOPS) as u128;
         let diff = value_usd.abs_diff(expected_value_usd);
-        if diff > 1 {
+        if diff > tolerance {
             env.panic_with_error(ReserveTrackerError::InconsistentReserve);
         }
 
@@ -278,13 +333,87 @@ impl ReserveTrackerContract {
         total_usd
     }
 
+    // -----------------------------------------------------------------------
+    // Reserve circuit breaker (AC-030)
+    //
+    // Minting and burning both gate on `is_reserve_sufficient`, so tripping
+    // this breaker halts mint and redeem together without any extra wiring.
+    // Contracts that link the tracker as a circuit-breaker peer also see it
+    // through `is_paused`.
+    // -----------------------------------------------------------------------
+
+    /// Trip the reserve circuit breaker (admin only). While paused,
+    /// [`Self::is_reserve_sufficient`] reports `false`.
+    pub fn pause(env: Env) {
+        Self::check_admin(&env);
+        let admin = Self::get_admin(env.clone());
+        env.storage().instance().set(&DATA_KEY.paused, &true);
+        env.events()
+            .publish((symbol_short!("paused"),), (admin, env.ledger().timestamp()));
+    }
+
+    /// Reset the reserve circuit breaker (admin only).
+    pub fn unpause(env: Env) {
+        Self::check_admin(&env);
+        let admin = Self::get_admin(env.clone());
+        env.storage().instance().set(&DATA_KEY.paused, &false);
+        env.events()
+            .publish((symbol_short!("unpaused"),), (admin, env.ledger().timestamp()));
+    }
+
+    /// Returns `true` if the reserve circuit breaker is tripped. Reports local
+    /// state only, so it is safe for circuit-breaker peers to call.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DATA_KEY.paused)
+            .unwrap_or(false)
+    }
+
     /// Return `true` if total reserve USD value backs `total_acbu_supply` at or
     /// above the configured minimum reserve ratio (default 100%).
     ///
     /// Sums the USD value of all stored reserves and compares it against the ACBU
-    /// supply valued at the oracle's ACBU/USD rate. Trivially returns `true` when
-    /// supply is non-positive or values to zero.
+    /// supply valued at the oracle's ACBU/USD rate. Always `false` while the
+    /// reserve circuit breaker is tripped (see [`Self::pause`]); otherwise
+    /// trivially `true` when supply is non-positive or values to zero.
+    ///
+    /// **AC-023 / SC-015 — Attestation gating:** This function is fail-closed with
+    /// respect to the Merkle attestation.  Before trusting any admin-reported reserve
+    /// values it verifies that:
+    ///
+    /// 1. A Merkle-root attestation has been submitted by the custodian (i.e.
+    ///    `attestation_ts` is present in storage), and
+    /// 2. The attestation is not older than `ATTESTATION_MAX_AGE_SECONDS` (24 h).
+    ///
+    /// If either condition is not met the function returns `false`, blocking minting
+    /// and burning until the custodian submits a fresh attestation.  This ensures
+    /// that the external, verifiable source of truth (SC-015) actively gates every
+    /// reserve check rather than being dead code.
     pub fn is_reserve_sufficient(env: Env, total_acbu_supply: i128) -> bool {
+        if Self::is_paused(env.clone()) {
+            return false;
+        }
+
+        // ── AC-023 / SC-015: Attestation freshness gate ──────────────────────
+        // Fail closed: if no attestation has ever been submitted, or the most
+        // recent one is older than ATTESTATION_MAX_AGE_SECONDS, treat reserves
+        // as untrustworthy and block mint / burn.
+        let attestation_ts: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&DATA_KEY.attestation_ts);
+        match attestation_ts {
+            None => return false, // No attestation ever submitted
+            Some(ts) => {
+                let now = env.ledger().timestamp();
+                if now.saturating_sub(ts) > ATTESTATION_MAX_AGE_SECONDS {
+                    return false; // Attestation has expired
+                }
+            }
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         if total_acbu_supply <= 0 {
             return true;
         }
@@ -305,9 +434,22 @@ impl ReserveTrackerContract {
             Vec::new(&env),
         );
 
-        let total_acbu_usd = (total_acbu_supply * acbu_usd_rate) / 100_000_000;
+        // Supply and rate are both 7-decimal, so divide by DECIMALS once to get
+        // a 7-decimal USD value comparable to `value_usd` (AC-002).
+        let total_acbu_usd = total_acbu_supply
+            .checked_mul(acbu_usd_rate)
+            .expect("Overflow in ACBU USD calculation")
+            .checked_div(DECIMALS)
+            .expect("Division by zero in ACBU USD calculation");
+        // AC-042: When total_acbu_usd rounds to zero the oracle rate is either
+        // zero (stale / uninitialized) or the supply is so small that a full
+        // reserve check cannot be performed.  Returning `true` here would be a
+        // trivial bypass — any caller could trigger this path with a tiny
+        // supply and empty reserves.  We return `false` so that minting is
+        // blocked until a valid, positive oracle rate is available and the
+        // reserve-ratio check can proceed properly.
         if total_acbu_usd == 0 {
-            return true;
+            return false;
         }
 
         let min_reserve_ratio = env
@@ -316,7 +458,11 @@ impl ReserveTrackerContract {
             .get(&DATA_KEY.min_reserve_ratio)
             .unwrap_or(10000i128); // Default to 100%
 
-        let current_ratio = (total_reserve_usd * BASIS_POINTS) / total_acbu_usd;
+        let current_ratio = total_reserve_usd
+            .checked_mul(BASIS_POINTS)
+            .expect("Overflow in reserve ratio calculation")
+            .checked_div(total_acbu_usd)
+            .expect("Division by zero in reserve ratio calculation");
         current_ratio >= min_reserve_ratio
     }
 
@@ -428,7 +574,10 @@ impl ReserveTrackerContract {
     fn hash_leaf(env: &Env, leaf: &AttestationLeaf) -> BytesN<32> {
         let mut buf = Bytes::new(env);
         let code = leaf.currency.code();
-        let code_bytes = code.to_bytes();
+        let mut code_buf = [0u8; 32];
+        code.copy_into_slice(&mut code_buf);
+        let code_len = code.len() as usize;
+        let code_bytes = Bytes::from_slice(env, &code_buf[..code_len]);
         buf.append(&code_bytes);
         let amt_bytes = Bytes::from_slice(env, &leaf.amount.to_be_bytes()[..]);
         buf.append(&amt_bytes);
@@ -436,7 +585,7 @@ impl ReserveTrackerContract {
         buf.append(&val_bytes);
         let ts_bytes = Bytes::from_slice(env, &leaf.timestamp.to_be_bytes()[..]);
         buf.append(&ts_bytes);
-        env.crypto().keccak256(&buf)
+        env.crypto().keccak256(&buf).into()
     }
 
     /// Walk up the Merkle tree from `leaf_hash` using `proof` and `index`.
@@ -459,7 +608,7 @@ impl ReserveTrackerContract {
                 combined.append(&sib_bytes);
                 combined.append(&cur_bytes);
             }
-            current = env.crypto().keccak256(&combined);
+            current = env.crypto().keccak256(&combined).into();
         }
         current
     }
