@@ -113,16 +113,6 @@ const DATA_KEY: DataKey = DataKey {
     attestation_ts: symbol_short!("ATT_TS"),
 };
 
-/// A single currency attestation entry in a Merkle tree, submitted by the custodian.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AttestationLeaf {
-    pub currency: CurrencyCode,
-    pub amount: i128,
-    pub value_usd: i128,
-    pub timestamp: u64,
-}
-
 /// Admin rotation timelock: the pending admin must wait this long before
 /// claiming ownership, giving the current admin a window to cancel a mistaken
 /// or malicious transfer.
@@ -336,7 +326,7 @@ impl ReserveTrackerContract {
         let total_acbu_usd = total_acbu_supply
             .checked_mul(acbu_usd_rate)
             .expect("Overflow in ACBU USD calculation")
-            .checked_div(100_000_000)
+            .checked_div(DECIMALS)
             .expect("Division by zero in ACBU USD calculation");
         if total_acbu_usd == 0 {
             return true;
