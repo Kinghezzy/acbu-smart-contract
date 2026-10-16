@@ -595,8 +595,9 @@ impl MintingContract {
             &Symbol::new(&env, ORACLE_GET_CURRENCIES),
             vec![&env],
         );
+        // Reject baskets with too many currencies to avoid excessive gas costs
         if currencies.len() > 10 {
-            env.panic_with_error(MintingError::InvalidRecipient);
+            env.panic_with_error(MintingError::InvalidMintAmount);
         }
 
         let usd_total: i128 = acbu_amount
